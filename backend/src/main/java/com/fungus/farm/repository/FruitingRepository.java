@@ -3,6 +3,7 @@ package com.fungus.farm.repository;
 import com.fungus.farm.domain.FruitingBatch;
 import com.fungus.farm.domain.HarvestFlush;
 import com.fungus.farm.domain.HarvestInventory;
+import com.fungus.farm.domain.HarvestRequestLog;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -20,20 +21,27 @@ public class FruitingRepository {
     private final SimpleJdbcInsert batchInsert;
     private final SimpleJdbcInsert flushInsert;
     private final SimpleJdbcInsert inventoryInsert;
+    private final SimpleJdbcInsert requestLogInsert;
     private final BeanPropertyRowMapper<FruitingBatch> batchMapper = BeanPropertyRowMapper.newInstance(FruitingBatch.class);
     private final BeanPropertyRowMapper<HarvestFlush> flushMapper = BeanPropertyRowMapper.newInstance(HarvestFlush.class);
+    private final BeanPropertyRowMapper<HarvestInventory> inventoryMapper = BeanPropertyRowMapper.newInstance(HarvestInventory.class);
+    private final BeanPropertyRowMapper<HarvestRequestLog> requestLogMapper = BeanPropertyRowMapper.newInstance(HarvestRequestLog.class);
 
     public FruitingRepository(NamedParameterJdbcTemplate jdbc, DataSource dataSource) {
         this.jdbc = jdbc;
         this.batchInsert = new SimpleJdbcInsert(dataSource).withTableName("fruiting_batch").usingGeneratedKeyColumns("id");
         this.flushInsert = new SimpleJdbcInsert(dataSource).withTableName("harvest_flush").usingGeneratedKeyColumns("id");
         this.inventoryInsert = new SimpleJdbcInsert(dataSource).withTableName("harvest_inventory").usingGeneratedKeyColumns("id");
+        this.requestLogInsert = new SimpleJdbcInsert(dataSource).withTableName("harvest_request_log");
     }
 
     public List<Map<String, Object>> findAllWithHarvests() {
         String sql = """
                 SELECT fb.id, fb.batch_no, fb.species, fb.entry_date, fb.expected_yield,
                        fb.harvested_yield, fb.status, gr.room_code, bb.batch_no AS bag_batch_no,
+                       COALESCE(SUM(hf.grade_a_yield),0) AS grade_a_total,
+                       COALESCE(SUM(hf.grade_b_yield),0) AS grade_b_total,
+                       COALESCE(SUM(hf.grade_c_yield),0) AS grade_c_total,
                        COALESCE(SUM(CASE WHEN hf.flush_no=1 THEN hf.yield_kg ELSE 0 END),0) AS flush_one,
                        COALESCE(SUM(CASE WHEN hf.flush_no=2 THEN hf.yield_kg ELSE 0 END),0) AS flush_two,
                        COALESCE(SUM(CASE WHEN hf.flush_no=3 THEN hf.yield_kg ELSE 0 END),0) AS flush_three
@@ -124,6 +132,14 @@ public class FruitingRepository {
                 new MapSqlParameterSource().addValue("batchId", batchId).addValue("flushNo", flushNo), flushMapper).stream().findFirst();
     }
 
+    /** 采收/更正时锁定潮次行：与并发更正互斥，等级合计不会被互相覆盖 */
+    public Optional<HarvestFlush> findFlushForUpdate(Long batchId, Integer flushNo) {
+        return jdbc.query(
+                "SELECT * FROM harvest_flush WHERE batch_id=:batchId AND flush_no=:flushNo FOR UPDATE",
+                new MapSqlParameterSource().addValue("batchId", batchId).addValue("flushNo", flushNo), flushMapper)
+                .stream().findFirst();
+    }
+
     public Long saveBatch(FruitingBatch batch) {
         return batchInsert.executeAndReturnKey(new BeanPropertySqlParameterSource(batch)).longValue();
     }
@@ -136,17 +152,60 @@ public class FruitingRepository {
         jdbc.update("""
                 UPDATE harvest_flush SET harvest_date=:harvestDate, grade_a_yield=:gradeAYield,
                     grade_b_yield=:gradeBYield, grade_c_yield=:gradeCYield, yield_kg=:yieldKg,
-                    harvested_by=:harvestedBy, status=:status WHERE id=:id
+                    harvested_by=:harvestedBy, status=:status, revision_no=:revisionNo WHERE id=:id
                 """, new BeanPropertySqlParameterSource(flush));
     }
 
-    public void updateBatchYield(Long batchId, java.math.BigDecimal harvestedYield) {
-        jdbc.update("UPDATE fruiting_batch SET harvested_yield=:yield WHERE id=:id",
-                new MapSqlParameterSource().addValue("id", batchId).addValue("yield", harvestedYield));
+    /**
+     * 条件式原子更新：仅当新累计不超过预产量时才落库（行锁之外再兜底一层，并发更正也不可能突破剩余预产量）。
+     * 返回受影响行数，0 表示已被并发事务抢占，调用方整体回滚。
+     */
+    public int updateBatchYieldIfWithinExpected(Long batchId, java.math.BigDecimal harvestedYield) {
+        return jdbc.update("""
+                UPDATE fruiting_batch SET harvested_yield=:yield
+                WHERE id=:id AND :yield <= expected_yield AND :yield >= 0
+                """, new MapSqlParameterSource().addValue("id", batchId).addValue("yield", harvestedYield));
     }
 
     public Long saveInventory(HarvestInventory inventory) {
         return inventoryInsert.executeAndReturnKey(new BeanPropertySqlParameterSource(inventory)).longValue();
+    }
+
+    public List<HarvestInventory> findInventories(Long batchId) {
+        return jdbc.query(
+                "SELECT * FROM harvest_inventory WHERE fruiting_batch_id=:batchId ORDER BY id",
+                new MapSqlParameterSource().addValue("batchId", batchId), inventoryMapper);
+    }
+
+    public List<HarvestInventory> findInventories(Long batchId, Integer flushNo) {
+        return jdbc.query("""
+                SELECT * FROM harvest_inventory
+                WHERE fruiting_batch_id=:batchId AND flush_no=:flushNo ORDER BY id
+                """, new MapSqlParameterSource().addValue("batchId", batchId).addValue("flushNo", flushNo),
+                inventoryMapper);
+    }
+
+    public List<HarvestInventory> findInventoriesByIds(List<Long> ids) {
+        if (ids.isEmpty()) {
+            return List.of();
+        }
+        return jdbc.query("SELECT * FROM harvest_inventory WHERE id IN (:ids) ORDER BY id",
+                new MapSqlParameterSource("ids", ids), inventoryMapper);
+    }
+
+    public Optional<HarvestRequestLog> findRequestLogForKey(String requestKey) {
+        return jdbc.query("SELECT * FROM harvest_request_log WHERE request_key=:requestKey",
+                new MapSqlParameterSource("requestKey", requestKey), requestLogMapper).stream().findFirst();
+    }
+
+    /** 幂等落账标记：request_key 主键冲突时说明并发重复请求已抢先落账，交由调用方回放首次结果 */
+    public void saveRequestLog(HarvestRequestLog log) {
+        requestLogInsert.execute(new BeanPropertySqlParameterSource(log));
+    }
+
+    public void markRequestDuplicated(String requestKey) {
+        jdbc.update("UPDATE harvest_request_log SET duplicated=1 WHERE request_key=:requestKey",
+                new MapSqlParameterSource("requestKey", requestKey));
     }
 
     public List<Map<String, Object>> yieldStatsByRoom() {

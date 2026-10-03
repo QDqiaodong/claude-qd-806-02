@@ -31,6 +31,7 @@ export const farmApi = {
   revokeAllocation: (id, data) => http.post(`/bag-allocations/${id}/revoke`, data),
   getFruitingBatches: () => http.get('/fruiting-batches'),
   getFlushes: batchId => http.get(`/fruiting-batches/${batchId}/flushes`),
+  getHarvestInventory: batchId => http.get(`/fruiting-batches/${batchId}/inventory`),
   harvest: (batchId, flushNo, data) => http.post(`/fruiting-batches/${batchId}/flushes/${flushNo}/harvest`, data),
   getRoomYields: () => http.get('/fruiting-batches/room-yields'),
   getContaminations: () => http.get('/contaminations'),

@@ -16,4 +16,6 @@ public class HarvestFlush {
     private BigDecimal yieldKg;
     private String harvestedBy;
     private String status;
+    /** 第几次录入/更正：首录为 1，之后每次真实更正 +1，零变化重提不累加 */
+    private Integer revisionNo;
 }

@@ -2,6 +2,7 @@ SET NAMES utf8mb4;
 SET FOREIGN_KEY_CHECKS = 0;
 DROP TABLE IF EXISTS bag_allocation;
 DROP TABLE IF EXISTS number_seq;
+DROP TABLE IF EXISTS harvest_request_log;
 DROP TABLE IF EXISTS harvest_inventory;
 DROP TABLE IF EXISTS contamination_record;
 DROP TABLE IF EXISTS harvest_flush;
@@ -147,6 +148,7 @@ CREATE TABLE harvest_flush (
     yield_kg DECIMAL(10,2) NOT NULL DEFAULT 0,
     harvested_by VARCHAR(40) NULL,
     status VARCHAR(16) NOT NULL,
+    revision_no INT NOT NULL DEFAULT 1,
     UNIQUE KEY uk_batch_flush (batch_id, flush_no),
     CONSTRAINT fk_flush_batch FOREIGN KEY (batch_id) REFERENCES fruiting_batch(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -175,15 +177,45 @@ CREATE TABLE contamination_record (
     CONSTRAINT fk_contamination_bag FOREIGN KEY (bag_batch_id) REFERENCES bag_batch(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- 采收库存流水（只追加账本，不做原地覆盖）：
+-- 首次采收录“入库”；更正时先追加一条“冲正”（按旧等级构成抵消原入库），再追加一条“更正入库”。
+-- 同一潮次流水数量之和恒等于当前潮次产量，减产也只是净额变小，不会出现负数库存余额（balance_qty 始终>=0）。
+-- change_type + revision_no 标注每条流水的来源版本，request_key 关联幂等请求，全程可追溯。
 CREATE TABLE harvest_inventory (
     id BIGINT PRIMARY KEY AUTO_INCREMENT,
     fruiting_batch_id BIGINT NOT NULL,
     flush_no INT NOT NULL,
     quantity DECIMAL(10,2) NOT NULL,
+    change_type VARCHAR(16) NOT NULL,
+    revision_no INT NOT NULL DEFAULT 1,
+    grade_a_delta DECIMAL(10,2) NOT NULL DEFAULT 0,
+    grade_b_delta DECIMAL(10,2) NOT NULL DEFAULT 0,
+    grade_c_delta DECIMAL(10,2) NOT NULL DEFAULT 0,
+    balance_qty DECIMAL(10,2) NOT NULL DEFAULT 0,
+    request_key VARCHAR(64) NULL,
     grade_summary VARCHAR(160) NOT NULL,
     operator VARCHAR(40) NOT NULL,
     recorded_at DATETIME NOT NULL,
+    KEY idx_inventory_batch_flush (fruiting_batch_id, flush_no, id),
     CONSTRAINT fk_inventory_batch FOREIGN KEY (fruiting_batch_id) REFERENCES fruiting_batch(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 采收/更正请求幂等表：request_key 唯一，同一请求（双击、网络重试、刷新后重发同一 key）只生效一次。
+-- payload_hash 记录首次请求的等级构成，同 key 携带不同数据说明请求被错误复用，直接拒绝而不是再次记账。
+-- change_ids 保存本次请求写入的库存流水 id（逗号分隔），重复到达时原样回放，结果可追溯。
+CREATE TABLE harvest_request_log (
+    request_key VARCHAR(64) PRIMARY KEY,
+    fruiting_batch_id BIGINT NOT NULL,
+    flush_no INT NOT NULL,
+    revision_no INT NOT NULL,
+    yield_changed TINYINT(1) NOT NULL,
+    duplicated TINYINT(1) NOT NULL DEFAULT 0,
+    payload_hash VARCHAR(64) NOT NULL,
+    result_message VARCHAR(255) NOT NULL,
+    change_ids VARCHAR(120) NOT NULL DEFAULT '',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    KEY idx_request_batch (fruiting_batch_id, flush_no),
+    CONSTRAINT fk_request_batch FOREIGN KEY (fruiting_batch_id) REFERENCES fruiting_batch(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- 出菇批次发号器：入房分配与历史批次共用同一序列，事务内原子自增，多人同时分配也不会重号
@@ -322,11 +354,12 @@ INSERT INTO contamination_record (bag_batch_id, contamination_type, discovered_d
 (4, '链孢霉', '2026-09-23', '隔离', 22, '单独转入观察区'),
 (8, '细菌', '2026-09-24', '药剂', 16, '地面与层架完成消毒');
 
-INSERT INTO harvest_inventory (fruiting_batch_id, flush_no, quantity, grade_summary, operator, recorded_at) VALUES
-(1, 1, 168.00, 'A:112kg / B:42kg / C:14kg', '周启明', '2026-09-08 17:10:00'),
-(1, 2, 126.00, 'A:78kg / B:36kg / C:12kg', '周启明', '2026-09-18 16:40:00'),
-(2, 1, 144.00, 'A:88kg / B:42kg / C:14kg', '许芳', '2026-09-12 18:05:00'),
-(2, 2, 98.00, 'A:58kg / B:31kg / C:9kg', '许芳', '2026-09-22 16:25:00'),
-(3, 1, 210.00, 'A:126kg / B:63kg / C:21kg', '韩冬', '2026-09-20 18:30:00'),
-(4, 1, 132.00, 'A:76kg / B:42kg / C:14kg', '林洁', '2026-09-18 17:50:00'),
-(4, 2, 84.00, 'A:46kg / B:29kg / C:9kg', '林洁', '2026-09-25 15:35:00');
+INSERT INTO harvest_inventory
+(fruiting_batch_id, flush_no, quantity, change_type, revision_no, grade_a_delta, grade_b_delta, grade_c_delta, balance_qty, request_key, grade_summary, operator, recorded_at) VALUES
+(1, 1, 168.00, '入库', 1, 112.00, 42.00, 14.00, 168.00, NULL, 'A:112kg / B:42kg / C:14kg', '周启明', '2026-09-08 17:10:00'),
+(1, 2, 126.00, '入库', 1, 78.00, 36.00, 12.00, 126.00, NULL, 'A:78kg / B:36kg / C:12kg', '周启明', '2026-09-18 16:40:00'),
+(2, 1, 144.00, '入库', 1, 88.00, 42.00, 14.00, 144.00, NULL, 'A:88kg / B:42kg / C:14kg', '许芳', '2026-09-12 18:05:00'),
+(2, 2, 98.00, '入库', 1, 58.00, 31.00, 9.00, 98.00, NULL, 'A:58kg / B:31kg / C:9kg', '许芳', '2026-09-22 16:25:00'),
+(3, 1, 210.00, '入库', 1, 126.00, 63.00, 21.00, 210.00, NULL, 'A:126kg / B:63kg / C:21kg', '韩冬', '2026-09-20 18:30:00'),
+(4, 1, 132.00, '入库', 1, 76.00, 42.00, 14.00, 132.00, NULL, 'A:76kg / B:42kg / C:14kg', '林洁', '2026-09-18 17:50:00'),
+(4, 2, 84.00, '入库', 1, 46.00, 29.00, 9.00, 84.00, NULL, 'A:46kg / B:29kg / C:9kg', '林洁', '2026-09-25 15:35:00');

@@ -185,6 +185,7 @@ public class BagAllocationService {
             flush.setGradeCYield(BigDecimal.ZERO);
             flush.setYieldKg(BigDecimal.ZERO);
             flush.setStatus("待采收");
+            flush.setRevisionNo(1);
             fruitingRepository.saveFlush(flush);
         }
 
