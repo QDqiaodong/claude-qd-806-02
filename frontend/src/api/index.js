@@ -32,6 +32,7 @@ export const farmApi = {
   getFruitingBatches: () => http.get('/fruiting-batches'),
   getFlushes: batchId => http.get(`/fruiting-batches/${batchId}/flushes`),
   harvest: (batchId, flushNo, data) => http.post(`/fruiting-batches/${batchId}/flushes/${flushNo}/harvest`, data),
+  getInventories: batchId => http.get(`/fruiting-batches/${batchId}/inventories`),
   getRoomYields: () => http.get('/fruiting-batches/room-yields'),
   getContaminations: () => http.get('/contaminations'),
   getContaminationSummary: () => http.get('/contaminations/summary'),

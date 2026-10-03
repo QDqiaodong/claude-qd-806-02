@@ -22,6 +22,7 @@ public class FruitingRepository {
     private final SimpleJdbcInsert inventoryInsert;
     private final BeanPropertyRowMapper<FruitingBatch> batchMapper = BeanPropertyRowMapper.newInstance(FruitingBatch.class);
     private final BeanPropertyRowMapper<HarvestFlush> flushMapper = BeanPropertyRowMapper.newInstance(HarvestFlush.class);
+    private final BeanPropertyRowMapper<HarvestInventory> inventoryMapper = BeanPropertyRowMapper.newInstance(HarvestInventory.class);
 
     public FruitingRepository(NamedParameterJdbcTemplate jdbc, DataSource dataSource) {
         this.jdbc = jdbc;
@@ -140,13 +141,26 @@ public class FruitingRepository {
                 """, new BeanPropertySqlParameterSource(flush));
     }
 
-    public void updateBatchYield(Long batchId, java.math.BigDecimal harvestedYield) {
-        jdbc.update("UPDATE fruiting_batch SET harvested_yield=:yield WHERE id=:id",
+    /** 累计采收原子兜底更新：只有不超过预产量才落库，返回 0 表示并发下预产量已不足 */
+    public int updateBatchYield(Long batchId, java.math.BigDecimal harvestedYield) {
+        return jdbc.update("UPDATE fruiting_batch SET harvested_yield=:yield WHERE id=:id AND expected_yield>=:yield",
                 new MapSqlParameterSource().addValue("id", batchId).addValue("yield", harvestedYield));
     }
 
     public Long saveInventory(HarvestInventory inventory) {
         return inventoryInsert.executeAndReturnKey(new BeanPropertySqlParameterSource(inventory)).longValue();
+    }
+
+    /** 幂等查询：同一请求标识是否已入账（采收事务在批次行锁内调用，与入账互斥） */
+    public Optional<HarvestInventory> findInventoryByRequestKey(String requestKey) {
+        return jdbc.query("SELECT * FROM harvest_inventory WHERE request_key=:key",
+                Map.of("key", requestKey), inventoryMapper).stream().findFirst();
+    }
+
+    /** 批次全部库存流水（按入账顺序），用于页面展示与对账 */
+    public List<HarvestInventory> findInventories(Long batchId) {
+        return jdbc.query("SELECT * FROM harvest_inventory WHERE fruiting_batch_id=:id ORDER BY id",
+                Map.of("id", batchId), inventoryMapper);
     }
 
     public List<Map<String, Object>> yieldStatsByRoom() {

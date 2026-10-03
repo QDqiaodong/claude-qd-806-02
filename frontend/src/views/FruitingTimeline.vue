@@ -6,10 +6,13 @@ import { farmApi } from '../api'
 const batches = ref([])
 const selectedId = ref(null)
 const flushes = ref([])
+const inventories = ref([])
+const inventoryTotal = ref(0)
 const loading = ref(false)
 const dialogVisible = ref(false)
 const activeFlush = ref(null)
 const saving = ref(false)
+const requestKey = ref('')
 const form = reactive({ harvestDate: '', gradeAYield: 0, gradeBYield: 0, gradeCYield: 0, harvestedBy: '' })
 
 const selectedBatch = computed(() => batches.value.find(item => Number(item.id) === Number(selectedId.value)))
@@ -33,6 +36,21 @@ async function loadFlushes() {
   catch (error) { ElMessage.error(error.message) }
 }
 
+async function loadInventories() {
+  if (!selectedId.value) return
+  try {
+    const data = await farmApi.getInventories(selectedId.value)
+    inventories.value = data.rows || []
+    inventoryTotal.value = Number(data.total || 0)
+  } catch (error) { ElMessage.error(error.message) }
+}
+
+function newRequestKey() {
+  return window.crypto?.randomUUID
+    ? window.crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
+
 function openHarvest(flush) {
   if (selectedBatch.value?.status === '环境暂停') {
     ElMessage.warning('该批次因环境越限处置暂停生产，处置单解除后才能采收')
@@ -44,17 +62,32 @@ function openHarvest(flush) {
   form.gradeBYield = Number(flush.gradeBYield || 0)
   form.gradeCYield = Number(flush.gradeCYield || 0)
   form.harvestedBy = flush.harvestedBy || ''
+  // 每次打开表单生成一次请求标识：重复点击/网络重试都按同一单处理，不会重复入账
+  requestKey.value = newRequestKey()
   dialogVisible.value = true
 }
 
 async function submitHarvest() {
   saving.value = true
   try {
-    await farmApi.harvest(selectedId.value, activeFlush.value.flushNo, { ...form })
-    ElMessage.success('采收产量已写入批次与库存')
+    const result = await farmApi.harvest(selectedId.value, activeFlush.value.flushNo, {
+      ...form,
+      requestKey: requestKey.value
+    })
+    if (result.result === 'UNCHANGED') {
+      ElMessage.info('与已入账记录一致，未产生新的库存流水')
+    } else if (result.result === 'DUPLICATED') {
+      ElMessage.warning('该请求已入账，重复提交已忽略')
+    } else {
+      const quantity = Number(result.inventory?.quantity || 0)
+      ElMessage.success(quantity >= 0
+        ? `采收已入账，库存 +${quantity.toFixed(1)} kg`
+        : `更正已入账，库存冲正 ${quantity.toFixed(1)} kg`)
+    }
     dialogVisible.value = false
     await loadBatches()
     await loadFlushes()
+    await loadInventories()
   } catch (error) { ElMessage.error(error.message) }
   finally { saving.value = false }
 }
@@ -68,7 +101,16 @@ function flushName(no) {
   return ['一潮', '二潮', '三潮'][no - 1]
 }
 
-watch(selectedId, loadFlushes)
+function signedKg(value) {
+  const num = Number(value || 0)
+  return `${num >= 0 ? '+' : ''}${num.toFixed(1)}`
+}
+
+function formatTime(value) {
+  return value ? String(value).replace('T', ' ').slice(0, 16) : ''
+}
+
+watch(selectedId, () => { loadFlushes(); loadInventories() })
 onMounted(loadBatches)
 </script>
 
@@ -129,7 +171,27 @@ onMounted(loadBatches)
       </div>
     </div>
 
-    <el-dialog v-model="dialogVisible" width="520px" :title="`${flushName(activeFlush?.flushNo || 1)}采收录入`" class="farm-dialog">
+    <div class="inventory-ledger" v-if="inventories.length">
+      <div class="inventory-ledger-title">
+        <span>库存流水</span>
+        <small>更正只追加差额流水，历史全部保留；合计 {{ inventoryTotal.toFixed(1) }} kg，与批次累计采收一致</small>
+      </div>
+      <div v-for="row in inventories" :key="row.id" class="inventory-row" :class="{ reversal: row.entryType !== '入库' }">
+        <div class="inventory-main">
+          <b>{{ flushName(row.flushNo) }} · {{ row.entryType }}</b>
+          <span>{{ row.gradeSummary }}</span>
+        </div>
+        <div class="inventory-side">
+          <strong>{{ signedKg(row.quantity) }} kg</strong>
+          <small>{{ row.operator }} · {{ formatTime(row.recordedAt) }}</small>
+        </div>
+      </div>
+    </div>
+
+    <el-dialog v-model="dialogVisible" width="520px" :title="`${flushName(activeFlush?.flushNo || 1)}${activeFlush?.status === '已采收' ? '采收更正' : '采收录入'}`" class="farm-dialog">
+      <div v-if="activeFlush?.status === '已采收'" class="correct-hint">
+        当前已入账 {{ Number(activeFlush?.yieldKg || 0).toFixed(1) }} kg；更正将按差额追加库存流水（增量入库 / 减量冲正），原记录保留可追溯。
+      </div>
       <el-form label-position="top">
         <el-form-item label="采收日期"><el-date-picker v-model="form.harvestDate" type="date" value-format="YYYY-MM-DD" style="width:100%" /></el-form-item>
         <div class="three-inputs">

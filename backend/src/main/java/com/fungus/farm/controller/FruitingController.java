@@ -3,6 +3,7 @@ package com.fungus.farm.controller;
 import com.fungus.farm.common.ApiResponse;
 import com.fungus.farm.domain.HarvestFlush;
 import com.fungus.farm.dto.HarvestRequest;
+import com.fungus.farm.dto.HarvestResult;
 import com.fungus.farm.service.FruitingService;
 import java.util.List;
 import java.util.Map;
@@ -33,9 +34,20 @@ public class FruitingController {
     }
 
     @PostMapping("/{batchId}/flushes/{flushNo}/harvest")
-    public ApiResponse<HarvestFlush> harvest(@PathVariable Long batchId, @PathVariable Integer flushNo,
+    public ApiResponse<HarvestResult> harvest(@PathVariable Long batchId, @PathVariable Integer flushNo,
             @RequestBody HarvestRequest request) {
-        return ApiResponse.success("采收已入账", service.harvest(batchId, flushNo, request));
+        HarvestResult result = service.harvest(batchId, flushNo, request);
+        String message = switch (result.result()) {
+            case "UNCHANGED" -> "与已入账记录一致，未产生新的库存流水";
+            case "DUPLICATED" -> "该请求已入账，重复提交已忽略";
+            default -> "采收已入账";
+        };
+        return ApiResponse.success(message, result);
+    }
+
+    @GetMapping("/{batchId}/inventories")
+    public ApiResponse<Map<String, Object>> inventories(@PathVariable Long batchId) {
+        return ApiResponse.success(service.inventories(batchId));
     }
 
     @GetMapping("/room-yields")

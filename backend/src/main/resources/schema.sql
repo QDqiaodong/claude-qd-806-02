@@ -175,14 +175,23 @@ CREATE TABLE contamination_record (
     CONSTRAINT fk_contamination_bag FOREIGN KEY (bag_batch_id) REFERENCES bag_batch(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- 采收库存流水：只追加、不覆盖。首次采收与增量更正记正数“入库”，减量更正记负数“冲正”，
+-- 总量不变仅等级构成变化记零数量“调整”；grade_summary 记各等级差额，每行自洽（数量 = 各等级差额之和），
+-- 库存合计 = 各流水之和，恒等于批次累计采收，可逐行对账追溯。
+-- request_key 幂等：同一请求标识只入账一次，重复提交/网络重试不会产生重复流水；
+-- 历史行 request_key 为 NULL，MySQL 唯一索引不约束 NULL，互不影响。
 CREATE TABLE harvest_inventory (
     id BIGINT PRIMARY KEY AUTO_INCREMENT,
     fruiting_batch_id BIGINT NOT NULL,
     flush_no INT NOT NULL,
+    entry_type VARCHAR(16) NOT NULL DEFAULT '入库',
     quantity DECIMAL(10,2) NOT NULL,
     grade_summary VARCHAR(160) NOT NULL,
     operator VARCHAR(40) NOT NULL,
+    request_key VARCHAR(64) NULL,
     recorded_at DATETIME NOT NULL,
+    UNIQUE KEY uk_inventory_request (request_key),
+    KEY idx_inventory_batch (fruiting_batch_id, id),
     CONSTRAINT fk_inventory_batch FOREIGN KEY (fruiting_batch_id) REFERENCES fruiting_batch(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
